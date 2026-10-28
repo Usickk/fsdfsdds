@@ -5,6 +5,7 @@
 """
 import asyncio
 import html
+import hashlib
 import json
 import logging
 import math
@@ -14,7 +15,9 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -34,7 +37,8 @@ try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 except ValueError:
     ADMIN_ID = 0
-DB_PATH = "one_piece_game.db"
+DB_PATH = os.environ.get("DB_PATH", "one_piece_game.db")  # на Render с диском: /var/data/one_piece_game.db
+NOTIFY_ON_START = os.environ.get("NOTIFY_ON_START", "0") == "1"  # рассылка «бот запущен/остановлен» всем игрокам
 BOSS_CHAR_DROP = 0.12
 GACHA_COOLDOWN = 2 * 60 * 60
 ADVENTURE_COOLDOWN = 30
@@ -2306,10 +2310,189 @@ async def on_error(update, context):
 async def post_init(app):
     await app.bot.set_my_commands([BotCommand("start", "🏴‍☠️ Меню / начать игру"), BotCommand("profile", "👤 Профиль"), BotCommand("gacha", "🎁 Сундук с сокровищами"), BotCommand("adventure", "🌊 Приключение"), BotCommand("boss", "👑 Боссы"), BotCommand("summon", "🎴 Призыв персонажей"), BotCommand("squad", "👥 Отряд"), BotCommand("characters", "📚 Коллекция персонажей"), BotCommand("upgrade", "📈 Улучшения"), BotCommand("inventory", " Инвентарь"), BotCommand("help", "📖 Помощь"), BotCommand("myid", "🆔 Мой ID")])
 
+# ── BACKUP-BEGIN ──────────────────────────────────────────────────────────
+# Бесплатный Render не хранит файлы между перезапусками. Поэтому бот сам кладёт копию базы
+# в закреплённое сообщение в вашем личном чате с ботом (ADMIN_ID) и при старте забирает её оттуда.
+TG_API = os.environ.get("TG_API", "https://api.telegram.org")
+BACKUP_TO_TELEGRAM = os.environ.get(
+    "TG_BACKUP", "1" if (os.environ.get("RENDER") or os.environ.get("RENDER_EXTERNAL_URL")) else "0") == "1"
+try:
+    BACKUP_INTERVAL = max(5, int(os.environ.get("BACKUP_INTERVAL_MIN", "30"))) * 60
+except ValueError:
+    BACKUP_INTERVAL = 30 * 60
+BACKUP_FILENAME = "one_piece_game_backup.db"
+BACKUP_STATE = {"msg_id": None, "skip_first": False, "blocked": False}
+
+
+def _tg(method, fields=None, file=None, timeout=60):
+    """Минимальный вызов Bot API через urllib (file = (имя_части, имя_файла, байты))."""
+    url = f"{TG_API}/bot{TOKEN}/{method}"
+    fields = fields or {}
+    if file:
+        part, fname, data = file
+        boundary = "----opbackup" + os.urandom(8).hex()
+        chunks = [f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode("utf-8")
+                  for k, v in fields.items()]
+        chunks.append((f'--{boundary}\r\nContent-Disposition: form-data; name="{part}"; filename="{fname}"\r\n'
+                       "Content-Type: application/octet-stream\r\n\r\n").encode() + data + b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode())
+        body, headers = b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    else:
+        body, headers = urlencode(fields).encode(), {}
+    with urlopen(Request(url, data=body, headers=headers, method="POST"), timeout=timeout) as r:
+        res = json.loads(r.read().decode("utf-8"))
+    if not res.get("ok"):
+        raise RuntimeError(f"{method}: {res}")
+    return res["result"]
+
+
+def _db_info(path):
+    """(макс. last_seen, число игроков) для файла БД; (0, 0), если файла нет или он пуст."""
+    try:
+        if not Path(path).exists():
+            return (0, 0)
+        c = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            return tuple(c.execute("SELECT COALESCE(MAX(last_seen),0), COUNT(*) FROM players").fetchone())
+        finally:
+            c.close()
+    except Exception:
+        return (0, 0)
+
+
+def tg_restore_db():
+    """Вызывается ДО init_db(): если в Telegram есть более свежая копия базы — берём её."""
+    if not (BACKUP_TO_TELEGRAM and ADMIN_ID and TOKEN):
+        return
+    try:
+        pin = _tg("getChat", {"chat_id": ADMIN_ID}, timeout=30).get("pinned_message") or {}
+        doc = pin.get("document") or {}
+        if doc.get("file_name") != BACKUP_FILENAME:
+            log.info("💾 Бэкапа в Telegram пока нет — первый будет создан после запуска")
+            return
+        BACKUP_STATE["msg_id"] = pin["message_id"]
+        info = _tg("getFile", {"file_id": doc["file_id"]}, timeout=30)
+        with urlopen(f"{TG_API}/file/bot{TOKEN}/{info['file_path']}", timeout=60) as r:
+            data = r.read()
+        db = Path(DB_PATH)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        tmp = db.with_name(db.name + ".restore")
+        tmp.write_bytes(data)
+        remote, local = _db_info(tmp), _db_info(db)
+        if remote[1] > 0 and (local[1] == 0 or remote[0] > local[0]):
+            for suffix in ("-wal", "-shm"):
+                Path(str(db) + suffix).unlink(missing_ok=True)
+            os.replace(tmp, db)
+            BACKUP_STATE["skip_first"] = True
+            log.info("💾 База восстановлена из бэкапа в Telegram (игроков: %s)", remote[1])
+        else:
+            tmp.unlink(missing_ok=True)
+            BACKUP_STATE["skip_first"] = remote == local  # то же самое — повторно не отправляем
+            log.info("💾 Локальная база не старее бэкапа в Telegram — оставляю её")
+    except Exception:
+        BACKUP_STATE["blocked"] = True  # не уверены, что в Telegram нет более свежей копии — не затираем её
+        log.exception("💾 Не удалось проверить бэкап в Telegram (напишите боту /start с админ-аккаунта). "
+                      "Бэкапы в этом запуске отключены")
+
+
+def _tg_backup_once(last_hash):
+    db = Path(DB_PATH)
+    tmp = db.with_name(db.name + ".bak")
+    src, dst = sqlite3.connect(db), sqlite3.connect(tmp)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    data = tmp.read_bytes()
+    tmp.unlink(missing_ok=True)
+    h = hashlib.md5(data).hexdigest()
+    if h == last_hash or (last_hash is None and BACKUP_STATE["skip_first"]):
+        return h
+    caption = f"💾 Бэкап базы • {datetime.now():%d.%m.%Y %H:%M}"
+    mid = BACKUP_STATE["msg_id"]
+    if mid:  # обновляем файл в уже закреплённом сообщении — без новых уведомлений и «закрепил сообщение»
+        try:
+            media = json.dumps({"type": "document", "media": "attach://file", "caption": caption})
+            _tg("editMessageMedia", {"chat_id": ADMIN_ID, "message_id": mid, "media": media},
+                file=("file", BACKUP_FILENAME, data))
+            return h
+        except Exception as e:
+            log.warning("💾 Не удалось обновить закреплённый бэкап (%s) — отправляю новый", e)
+    msg = _tg("sendDocument", {"chat_id": ADMIN_ID, "caption": caption, "disable_notification": "true"},
+              file=("document", BACKUP_FILENAME, data))
+    _tg("pinChatMessage", {"chat_id": ADMIN_ID, "message_id": msg["message_id"], "disable_notification": "true"})
+    BACKUP_STATE["msg_id"] = msg["message_id"]
+    log.info("💾 Бэкап базы отправлен в Telegram")
+    return h
+
+
+def tg_backup_loop():
+    last_hash = None
+    time.sleep(45)
+    while True:
+        if not BACKUP_STATE["blocked"]:
+            try:
+                if _db_info(DB_PATH)[1] > 0:  # пустую базу никогда не отправляем
+                    last_hash = _tg_backup_once(last_hash)
+            except Exception:
+                log.exception("💾 Ошибка бэкапа в Telegram")
+        time.sleep(BACKUP_INTERVAL)
+
+
+def _keepalive_loop(url):
+    """Раз в 10 минут обращается к собственному адресу, чтобы бесплатный сервис не засыпал."""
+    time.sleep(120)
+    while True:
+        try:
+            urlopen(url, timeout=30).read()
+        except Exception as e:
+            log.warning("keep-alive: %s", e)
+        time.sleep(600)
+# ── BACKUP-END ────────────────────────────────────────────────────────────
+
+def start_web_server():
+    """Render (Web Service) требует открытый HTTP-порт ($PORT), иначе деплой считается неудачным.
+    Заодно этот адрес можно пинговать (UptimeRobot / cron-job.org), чтобы бесплатный сервис не засыпал."""
+    port = os.environ.get("PORT")
+    if not port:
+        return  # локальный запуск — сервер не нужен
+
+    class Health(BaseHTTPRequestHandler):
+        def _reply(self, with_body):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            if with_body:
+                self.wfile.write(b"OK")
+
+        def do_GET(self):
+            self._reply(True)
+
+        def do_HEAD(self):
+            self._reply(False)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), Health)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log.info("🌐 Веб-сервер для Render запущен на порту %s", port)
+    ext_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if ext_url and os.environ.get("KEEPALIVE", "1") == "1":
+        threading.Thread(target=_keepalive_loop, args=(ext_url,), daemon=True).start()
+        log.info("⏰ Keep-alive включён: %s", ext_url)
+
 def main():
     if not TOKEN:
         raise SystemExit("Задайте токен: export BOT_TOKEN='ваш_токен'")
+    start_web_server()  # первым делом открываем порт, чтобы Render увидел сервис
+    tg_restore_db()     # забираем свежую копию базы из Telegram (если есть) — строго до init_db()
     init_db()
+    if BACKUP_TO_TELEGRAM and ADMIN_ID:
+        threading.Thread(target=tg_backup_loop, daemon=True).start()
+        log.info("💾 Автобэкап базы в Telegram включён (каждые %s мин.)", BACKUP_INTERVAL // 60)
     try:
         ensure_media()
     except Exception:
@@ -2388,11 +2571,12 @@ def main():
                 time.sleep(0.05)
             log.info(f"✅ Уведомлено о запуске: {sent} | Заблокировали бота: {blocked}")
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    startup_notification()
+    if NOTIFY_ON_START:
+        signal.signal(signal.SIGINT, shutdown_handler)
+        signal.signal(signal.SIGTERM, shutdown_handler)
+        startup_notification()
+        log.info("⚠️ Для остановки нажмите Ctrl+C — всем игрокам придет уведомление")
     log.info("🚀 Бот запущен. Админ: %s", ADMIN_ID or "не задан")
-    log.info("⚠️ Для остановки нажмите Ctrl+C — всем игрокам придет уведомление")
     app.run_polling()
 
 if __name__ == "__main__":
